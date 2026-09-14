@@ -12,6 +12,7 @@ use std::time::Duration;
 
 /// Pluto USB device with a cached IIO context and an owned control session.
 pub struct Device {
+    pub(crate) rx_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
     descriptor: DeviceDescriptor,
     interface: InterfaceInfo,
     info: Context,
@@ -66,11 +67,17 @@ impl Device {
             }
         )
     }
+    pub(crate) fn client_mut(&mut self) -> Result<&mut IiodClient<NusbTransport>> {
+        self.client.as_mut().ok_or(Error::DeviceClosed)
+    }
     /// Close the owned IIOD pipe. Lazy, terminal once started, and retryable.
     pub fn shutdown(&mut self) -> impl MaybeFuture<Output = Result<()>> + '_ {
         dual!(
             self,
             |this: &mut Self| {
+                if this.rx_claim.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(Error::Busy);
+                }
                 if let Some(client) = &mut this.client {
                     client.shutdown().wait()?;
                 }
@@ -78,6 +85,9 @@ impl Device {
                 Ok(())
             },
             |this: &mut Self| async move {
+                if this.rx_claim.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(Error::Busy);
+                }
                 if let Some(client) = &mut this.client {
                     client.shutdown().await?;
                 }
@@ -97,7 +107,7 @@ impl Device {
     }
 }
 
-/// USB selection and timeout settings; radio configuration is a later milestone.
+/// USB selection and default timeout settings.
 #[derive(Debug, Clone)]
 pub struct DeviceBuilder {
     serial: Option<String>,
@@ -149,6 +159,7 @@ impl DeviceBuilder {
                 let mut client = IiodClient::new(transport);
                 let info = client.context().wait()?;
                 Ok(Device {
+                    rx_claim: Default::default(),
                     descriptor,
                     interface,
                     info,
@@ -166,6 +177,7 @@ impl DeviceBuilder {
                 let mut client = IiodClient::new(transport);
                 let info = client.context().await?;
                 Ok(Device {
+                    rx_claim: Default::default(),
                     descriptor,
                     interface,
                     info,

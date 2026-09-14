@@ -16,6 +16,8 @@ pub struct NusbTransport {
     _device: nusb::Device,
     descriptor: InterfaceInfo,
     timeout: Duration,
+    pipe: u16,
+    deadline: Option<web_time::Instant>,
     buffered: VecDeque<u8>,
     needs_cleanup: bool,
     closed: bool,
@@ -40,7 +42,7 @@ impl NusbTransport {
                     .clone();
                 let interface = device.detach_and_claim_interface(info.number).wait()?;
                 interface.set_alt_setting(info.alternate_setting).wait()?;
-                let transport = Self::from_claim(device, interface, info, timeout)?;
+                let transport = Self::from_claim(device, interface, info, timeout, 0)?;
                 transport.pipe_command(0).wait()?;
                 transport.pipe_command(1).wait()?;
                 Ok(transport)
@@ -54,7 +56,7 @@ impl NusbTransport {
                     .clone();
                 let interface = device.detach_and_claim_interface(info.number).await?;
                 interface.set_alt_setting(info.alternate_setting).await?;
-                let transport = Self::from_claim(device, interface, info, timeout)?;
+                let transport = Self::from_claim(device, interface, info, timeout, 0)?;
                 transport.pipe_command(0).await?;
                 transport.pipe_command(1).await?;
                 Ok(transport)
@@ -67,8 +69,12 @@ impl NusbTransport {
         interface: Interface,
         descriptor: InterfaceInfo,
         timeout: Duration,
+        pipe: u16,
     ) -> Result<Self> {
-        let pair = descriptor.endpoint_pairs()?[0];
+        let pair = *descriptor
+            .endpoint_pairs()?
+            .get(usize::from(pipe))
+            .ok_or(Error::InvalidConfig("missing streaming endpoint pair"))?;
         Ok(Self {
             input: interface.endpoint::<Bulk, In>(pair.in_address)?,
             output: interface.endpoint::<Bulk, Out>(pair.out_address)?,
@@ -76,6 +82,8 @@ impl NusbTransport {
             _device: device,
             descriptor,
             timeout,
+            pipe,
+            deadline: None,
             buffered: VecDeque::new(),
             needs_cleanup: true,
             closed: false,
@@ -88,8 +96,47 @@ impl NusbTransport {
 
     fn pipe_command(&self, request: u8) -> impl MaybeFuture<Output = Result<()>> + use<> {
         self.interface
-            .control_out(pipe_request(request, self.descriptor.number), PIPE_TIMEOUT)
+            .control_out(
+                pipe_request(request, self.descriptor.number, self.pipe),
+                PIPE_TIMEOUT,
+            )
             .map_err(Error::from)
+    }
+
+    /// Factory for an independent pipe on the already claimed interface.
+    pub(crate) fn additional_pipe(&self, pipe: u16) -> Result<PipeFactory> {
+        self.check_open()?;
+        if pipe == 0 || usize::from(pipe) >= self.descriptor.endpoint_pairs()?.len() {
+            return Err(Error::InvalidConfig("missing streaming endpoint pair"));
+        }
+        Ok(PipeFactory {
+            device: self._device.clone(),
+            interface: self.interface.clone(),
+            descriptor: self.descriptor.clone(),
+            timeout: self.timeout,
+            pipe,
+        })
+    }
+
+    pub(crate) fn set_timeout(&mut self, timeout: Duration) -> Result<()> {
+        validate_timeout(timeout)?;
+        self.timeout = timeout;
+        self.deadline = Some(web_time::Instant::now() + timeout);
+        Ok(())
+    }
+
+    fn remaining_timeout(&self) -> Result<Duration> {
+        match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(web_time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(Error::Timeout),
+            None => Ok(self.timeout),
+        }
+    }
+
+    pub(crate) fn open_pipe(&mut self) -> impl MaybeFuture<Output = Result<()>> + use<> {
+        self.pipe_command(1)
     }
 
     fn check_open(&self) -> Result<()> {
@@ -130,12 +177,35 @@ impl NusbTransport {
     }
 }
 
-fn pipe_request(request: u8, interface: u8) -> ControlOut<'static> {
+pub(crate) struct PipeFactory {
+    device: nusb::Device,
+    interface: Interface,
+    descriptor: InterfaceInfo,
+    timeout: Duration,
+    pipe: u16,
+}
+
+impl PipeFactory {
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+    pub(crate) fn create(&self) -> Result<NusbTransport> {
+        NusbTransport::from_claim(
+            self.device.clone(),
+            self.interface.clone(),
+            self.descriptor.clone(),
+            self.timeout,
+            self.pipe,
+        )
+    }
+}
+
+fn pipe_request(request: u8, interface: u8, pipe: u16) -> ControlOut<'static> {
     ControlOut {
         control_type: ControlType::Vendor,
         recipient: Recipient::Interface,
         request,
-        value: 0,
+        value: pipe,
         index: u16::from(interface),
         data: &[],
     }
@@ -166,19 +236,32 @@ impl Transport for NusbTransport {
         dual!(
             (self, command),
             |(this, command): (&mut Self, &[u8])| {
-                this.check_open()?;
                 validate_command(command)?;
+                this.write_data(command).wait()
+            },
+            |(this, command): (&mut Self, &[u8])| async move {
+                validate_command(command)?;
+                this.write_data(command).await
+            }
+        )
+    }
+    fn write_data(&mut self, command: &[u8]) -> impl MaybeFuture<Output = Result<()>> {
+        dual!(
+            (self, command),
+            |(this, command): (&mut Self, &[u8])| {
+                this.check_open()?;
+                let timeout = this.remaining_timeout()?;
                 let completion = this
                     .output
-                    .transfer_blocking(command.to_vec().into(), this.timeout);
+                    .transfer_blocking(command.to_vec().into(), timeout);
                 check_blocking_timeout(&completion)?;
                 check_write(completion, command.len())
             },
             |(this, command): (&mut Self, &[u8])| async move {
                 this.check_open()?;
-                validate_command(command)?;
+                let timeout = this.remaining_timeout()?;
                 this.output.submit(command.to_vec().into());
-                let result = timed(this.output.next_complete(), this.timeout).await;
+                let result = timed(this.output.next_complete(), timeout).await;
                 if result.is_err() {
                     this.cancel_pending();
                 }
@@ -199,10 +282,9 @@ impl Transport for NusbTransport {
                     return Ok(bytes);
                 }
                 for _ in 0..16 {
+                    let timeout = this.remaining_timeout()?;
                     let size = read_size(max, this.input.max_packet_size());
-                    let completion = this
-                        .input
-                        .transfer_blocking(Buffer::new(size), this.timeout);
+                    let completion = this.input.transfer_blocking(Buffer::new(size), timeout);
                     check_blocking_timeout(&completion)?;
                     if let Some(bytes) = this.accept_read(completion, max)? {
                         return Ok(bytes);
@@ -219,9 +301,10 @@ impl Transport for NusbTransport {
                     return Ok(bytes);
                 }
                 for _ in 0..16 {
+                    let timeout = this.remaining_timeout()?;
                     let size = read_size(max, this.input.max_packet_size());
                     this.input.submit(Buffer::new(size));
-                    let result = timed(this.input.next_complete(), this.timeout).await;
+                    let result = timed(this.input.next_complete(), timeout).await;
                     if result.is_err() {
                         this.cancel_pending();
                     }
@@ -283,7 +366,7 @@ fn check_write(completion: nusb::transfer::Completion, length: usize) -> Result<
     Ok(())
 }
 fn read_size(max: usize, packet: usize) -> usize {
-    max.min(4096).div_ceil(packet) * packet
+    max.min(256 * 1024).div_ceil(packet) * packet
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -309,9 +392,10 @@ impl Drop for NusbTransport {
         {
             let interface = self.interface.clone();
             let number = self.descriptor.number;
+            let pipe = self.pipe;
             wasm_bindgen_futures::spawn_local(async move {
                 let _ = interface
-                    .control_out(pipe_request(2, number), PIPE_TIMEOUT)
+                    .control_out(pipe_request(2, number, pipe), PIPE_TIMEOUT)
                     .await;
             });
         }
@@ -326,7 +410,7 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn functionfs_commands_use_interface_recipient_and_logical_pipe_zero() {
         for command in [0, 1, 2] {
-            let request = pipe_request(command, 7);
+            let request = pipe_request(command, 7, 0);
             assert_eq!(request.control_type, ControlType::Vendor);
             assert_eq!(request.recipient, Recipient::Interface);
             assert_eq!(request.request, command);
@@ -348,8 +432,8 @@ mod tests {
             for max in [1, packet - 1, packet, packet + 1, 4096, usize::MAX] {
                 let size = read_size(max, packet);
                 assert!(size.is_multiple_of(packet));
-                assert!(size >= max.min(4096));
-                assert!(size <= 4096);
+                assert!(size >= max.min(256 * 1024));
+                assert!(size <= 256 * 1024);
             }
         }
     }

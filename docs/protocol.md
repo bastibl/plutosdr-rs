@@ -1,9 +1,9 @@
 # Native Pluto IIO USB protocol
 
-Research snapshot: 2026-09-11. This project implements the first milestone only:
+Research snapshot: 2026-09-11, extended for RX on 2026-09-14. The initial milestone covered:
 USB discovery, opening the IIO control pipe, and ASCII `PRINT` context discovery.
-No host AD9363 register driver, TCP transport, attribute writes, or sample
-streaming is implemented yet. The protocol is implemented independently in Rust;
+RX attribute control and streaming are now implemented as described below.
+The protocol is implemented independently in Rust;
 the C sources below are references, not linked or built dependencies.
 
 ## Sources inspected
@@ -89,8 +89,8 @@ so opening assumes exclusive ownership. It is not a USB device reset.
 Daemon `usb_open_pipe` opens FunctionFS files `ep(2*i+1)` for device writes
 (host IN) and `ep(2*i+2)` for device reads (host OUT), then starts an interpreter.
 Closing signals that session to stop; reopening joins its old threads first.
-libiio shutdown resets all pipes. This milestone explicitly closes its owned
-pipe 0 on shutdown and performs best-effort cleanup on drop/open failure.
+libiio shutdown resets all pipes. The driver explicitly closes each owned
+pipe on shutdown and performs best-effort cleanup on drop/open failure.
 
 ## Minimal exchange and framing
 
@@ -126,7 +126,7 @@ milestone never negotiates BINARY or ZPRINT, avoiding unnecessary version and
 compression machinery. A future binary implementation needs its own framing;
 binary buffer commands must not be mixed with ASCII sessions.
 
-## Attributes and future streaming (researched, not implemented)
+## ASCII attributes and streaming
 
 XML describes context metadata, IIO device IDs/names/labels, input/output
 channels, attribute names/filenames, and scan-element index/format/scale.
@@ -144,9 +144,9 @@ WRITE <device> [INPUT|OUTPUT <channel>] <attribute> <byte-count>\r\n
 DEBUG and BUFFER forms address other attribute namespaces. READ returns a
 decimal length, bytes, then newline. WRITE sends the value before reading the
 integer status. Bulk/all-attribute operations have additional framing and are
-out of scope. Future Pluto configuration will resolve PHY/RX/TX devices from
+out of scope. Pluto configuration resolves PHY/RX/TX devices from
 context data (commonly `ad9361-phy`, `cf-ad9361-lpc`, `cf-ad9361-dds-core-lpc`),
-then use attributes rather than host register writes or fixed `iio:deviceN` IDs.
+then uses attributes rather than host register writes or fixed `iio:deviceN` IDs.
 
 For an ASCII streaming session, reserve an additional endpoint pair, open its
 USB pipe, then send:
@@ -239,10 +239,64 @@ A subsequent Seify integration check on the same date passed with firmware
 devices. Seify's `pluto_hardware` test exercised registry discovery, typed and
 dynamic handles, shared clone ownership, idempotent shutdown, and reopening
 through the synchronous backend and both native async runtimes (smol and Tokio).
-Seify's Pluto backend currently exposes context metadata only, with zero RX/TX
-channels and no RF control or streaming capabilities.
+At that stage Seify exposed context metadata only; the RX work described below
+adds one RX channel and RF controls.
 
 These results validate pipe setup, PRINT framing/XML parsing, and normal
 control-session lifecycle on this device. Streaming pipes 1/2, attribute
 reads/writes, unplug/cancellation recovery on hardware, other host platforms,
 and browser WebUSB access were not exercised.
+
+## RX and configuration implementation
+
+The RX implementation continues to use the legacy ASCII interpreter on current
+firmware. References below are to the pinned libiio revision listed above:
+
+- `iiod-client.c::iiod_client_attr_read` and `iiod_client_attr_write`: READ is
+  length + bytes + newline; WRITE sends command and value in separate writes,
+  then receives a signed count. Attribute names and IDs must be individual
+  protocol tokens, and the value length is a byte count.
+- `usb.c::usb_open_buffer` / `usb_close_buffer`: reserve an extra endpoint pair,
+  OPEN_PIPE with its logical index in wValue, create an independent interpreter,
+  then CLOSE the IIO buffer and CLOSE_PIPE. Never RESET_PIPES when starting RX.
+- `iiod-client.c::iiod_client_open_with_mask`, `iiod_client_read_unlocked`,
+  `iiod/ops.c::open_dev_helper` and `send_data`: OPEN mask bits refer to the
+  server's ordered channel list; sample memory follows scan-element indices.
+  READBUF replies contain a mask only with the first positive chunk of each
+  request. Chunk lengths exclude the mask. A zero ends a short response; an
+  exact-length response has no zero trailer. Unexpected masks are rejected.
+- `examples/ad9361-iiostream.c::cfg_ad9361_streaming_ch`: RX PHY input voltage0
+  provides sampling_frequency, rf_bandwidth, and rf_port_select; PHY output
+  altvoltage0 provides RX LO frequency. gain_control_mode and hardwaregain are
+  RX input voltage0 attributes. IDs are resolved from context, not fixed numbers.
+
+Scope: one RX complex channel, signed 16-bit storage with validated scan format,
+normalized Complex32 output, configurable noncyclic buffer size, and bounded
+pull-based USB reads. RF ranges come from firmware *_available attributes.
+No FIR synthesis/loading or low-rate resampling is performed. RX port names
+represent AD936x internal selections, not extra exposed Pluto antenna connectors.
+Native reads use blocking USB only for .wait(); async reads await nusb directly.
+Cancelling an in-flight protocol operation poisons only its session; stop closes
+that USB pipe before restart. A stream owns the claimed interface lifetime, and
+explicit device shutdown is rejected while an RX stream handle exists.
+
+
+RX validation on firmware v0.39 / IIO v0.26 (2026-09-14): control readback,
+manual gain and all AGC modes, bandwidth and RF port selection, 786,432 samples
+across three native RX sessions plus restart/drop checks, and 1,048,576 samples
+through async RX with concurrent pipe-0 queries. Cancelling an in-flight RX
+request poisoned its session as intended; stop/restart restored sample reads.
+Seify's typed controls and dynamic streams also passed synchronous and async
+hardware tests. Sample captures varied and remained within the normalized range;
+no calibrated tone, timestamp continuity, or maximum-rate qualification was done.
+
+Firmware attribute READ payloads include a NUL byte in their advertised length.
+The generic IIOD method preserves it; RX configuration getters trim terminating
+NUL/whitespace. Sample-rate readback at a requested 2,500,000 samples/s was
+2,499,999 samples/s, consistent with hardware clock rounding. Available values
+came from PHY attributes, not hardcoded assumptions about AD9363/AD9364 limits.
+
+The AD936x range/mode mapping also follows
+[`ad9361.c`](https://github.com/analogdevicesinc/linux/blob/main/drivers/iio/adc/ad9361.c),
+functions `ad9361_phy_read_avail` and `ad9361_phy_lo_read`, and the
+`ad9361_phy_ext_info` / RX port and AGC enum tables.

@@ -58,7 +58,7 @@ pub struct Channel {
     pub scan_element: Option<ScanElement>,
 }
 
-/// Advertised sample layout. Interpretation/conversion belongs to later streaming work.
+/// Advertised sample layout. RX validates this format before converting samples.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanElement {
     pub index: i64,

@@ -7,6 +7,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
+    Busy,
+    StreamInactive,
     DeviceNotFound,
     IioInterfaceNotFound,
     AmbiguousIioInterface,
@@ -41,6 +43,8 @@ pub enum ErrorKind {
 impl Error {
     pub fn kind(&self) -> ErrorKind {
         match self {
+            Self::Busy => ErrorKind::Busy,
+            Self::StreamInactive => ErrorKind::Closed,
             Self::DeviceNotFound | Self::IioInterfaceNotFound => ErrorKind::NotFound,
             Self::DeviceClosed | Self::SessionPoisoned => ErrorKind::Closed,
             Self::Timeout => ErrorKind::Timeout,
@@ -62,6 +66,8 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Busy => f.write_str("an RX stream handle already owns the device"),
+            Self::StreamInactive => f.write_str("RX stream is inactive"),
             Self::DeviceNotFound => f.write_str("no matching PlutoSDR USB device found"),
             Self::IioInterfaceNotFound => {
                 f.write_str("no named IIO interface in the active USB configuration")

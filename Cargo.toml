@@ -15,6 +15,8 @@ tokio = ["nusb/tokio"]
 
 [dependencies]
 nusb = "0.2.7"
+num-complex = "0.4"
+web-time = "1"
 roxmltree = "0.21"
 futures-lite = "2"
 futures-timer = { version = "3", features = ["wasm-bindgen"] }
@@ -28,4 +30,8 @@ wasm-bindgen-test = "0.3"
 
 [[example]]
 name = "info_async"
+required-features = ["smol"]
+
+[[example]]
+name = "rx_async"
 required-features = ["smol"]

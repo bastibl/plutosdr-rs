@@ -3,11 +3,10 @@
 Native Rust PlutoSDR IIO-over-USB driver using `nusb`. No `libiio`, `libusb`,
 `rusb`, SoapySDR, C IIO bindings, USB Ethernet, or TCP transport.
 
-This is **milestone 1**: enumerate USB devices, inspect the composite USB
-descriptors, claim the named `IIO` FunctionFS interface, open its control pipe,
-and retrieve/parse the IIOD XML context. RF configuration and RX/TX streaming
-are deliberately deferred. See [the source-based protocol notes](docs/protocol.md)
-for the findings and follow-up protocol work.
+Supports USB discovery, IIOD context inspection, RX configuration, and one
+complex RX stream. The driver claims the named `IIO` FunctionFS interface and
+uses independent control and streaming bulk endpoint pairs. TX is not implemented.
+See [the source-based protocol notes](docs/protocol.md) for wire details.
 
 The API follows `hackrf-rs`: `Device`, `DeviceBuilder`, discovery descriptors,
 and operations with native `.wait()` or native/browser `.await`. All IIOD/XML
@@ -22,6 +21,9 @@ cargo run --example list -- --all       # inspect all USB devices/custom IDs
 cargo run --example info
 cargo run --example info -- YOUR_SERIAL
 cargo run --features smol --example info_async
+cargo run --example config             # read live settings and ranges
+cargo run --example rx                 # configure and capture RX
+cargo run --features smol --example rx_async
 ```
 
 `list` opens devices to read descriptors but does not claim interfaces or open
@@ -34,8 +36,8 @@ a Pluto reporting firmware `v0.35` and IIO version `0.24`. Both blocking and
 async paths passed 100 context refreshes across 10 open/close cycles each,
 including explicit shutdown and drop cleanup. See the
 [hardware results](docs/protocol.md#hardware-validation-2026-09-14).
-RF configuration/streaming remain unimplemented, and WebUSB hardware access
-remains unverified. The XML unit-test fixture is synthetic, not a device capture.
+RX configuration, capture, cancellation, and restart were subsequently verified
+on firmware v0.39 / IIO v0.26. WebUSB hardware access remains unverified. The XML unit-test fixture is synthetic, not a device capture.
 
 ## Native blocking
 
@@ -63,6 +65,63 @@ selected descriptor to `Device::builder().descriptor(...)`. Opening still
 requires the `IIO` name and a valid bulk endpoint layout. Use `.interface(n)`
 only to disambiguate multiple named IIO interfaces. The active configuration
 must contain IIO; the driver does not switch the whole composite configuration.
+
+## RX configuration and streaming
+
+The same methods support native `.wait()` and native/browser `.await`:
+
+```rust,no_run
+use plutosdr::{Complex32, Device, GainMode, MaybeFuture};
+# fn main() -> plutosdr::Result<()> {
+let mut device = Device::open().wait()?;
+device.set_frequency_hz(2_450_000_000).wait()?;
+device.set_sample_rate_hz(2_500_000).wait()?;
+device.set_bandwidth_hz(2_000_000).wait()?;
+device.set_gain_db(30.0).wait()?; // switches to manual gain
+// Or: device.set_gain_mode(GainMode::SlowAttack).wait()?;
+let mut rx = device.rx_stream()?;
+let mut samples = vec![Complex32::default(); rx.mtu()];
+rx.start().wait()?;
+let count = rx.read(&mut samples, None).wait()?;
+println!("received {count} complex samples");
+rx.stop().wait()?;
+drop(rx);
+device.shutdown().wait()?;
+# Ok(())
+# }
+```
+
+Controls include frequency (Hz), sample rate (samples/s), RF bandwidth (Hz),
+gain (dB), `GainMode::{Manual, SlowAttack, FastAttack, Hybrid}`, and RF port
+selection. Getters read hardware instead of returning requested values; AD936x
+clock rounding can change readback by a few Hz. `rx_range(RxAttribute::...)`
+queries firmware limits, including gain limits that change with LO frequency.
+`read_rx_attribute(attr, true)` also exposes available mode/port strings.
+Setting gain selects manual mode; failures may leave that mode applied. RX port
+names describe internal AD936x inputs, not extra physical Pluto connectors.
+
+No FIR filter loading or resampling is performed. With the connected firmware's
+FIR state, the minimum sample rate is 2,083,333 samples/s; 2 MS/s is rejected.
+Use the reported range for your firmware and current configuration. RX/TX
+sample clocks are related in the hardware; sample-rate changes can affect TX.
+
+`rx_stream_with_buffer(samples)` selects the DMA block size (default 65,536
+complex frames). `read` converts signed scan words to normalized `Complex32`,
+with each component in [-1, 1). Smaller destination buffers consume a cached
+block without discarding its tail. The timeout bounds the complete READBUF USB
+exchange; `None` uses the builder timeout. Zero polls cached samples, otherwise
+returns `Error::Timeout` without USB I/O. An interrupted exchange requires
+`stop` before `start`. Stop clears buffered samples and can be repeated.
+
+One stream handle is reserved at a time, including while stopped. It owns the
+USB lifetime and can outlive `Device`. Drop it before device shutdown or creating
+a replacement handle. Control requests use pipe 0 while RX uses pipe 1, so they
+can run concurrently. Retuning/reconfiguring while RX is active can mix old and
+new settings in buffered data; stop/restart when that distinction matters.
+
+This is bounded, pull-based RX. There is no background host queue, timestamping,
+or reliable sample-loss indication in this legacy exchange. Sustained throughput
+and sample continuity at the maximum advertised rate are not guaranteed.
 
 ## Native async
 
@@ -117,11 +176,11 @@ on unrelated composite functions.
   text. Unknown optional elements are ignored. Attribute values usually require
   a later READ; discovering an attribute does not read it.
 - Opening resets all IIOD pipes on the claimed IIO interface, matching upstream.
-  Use exclusive access. No radio configuration commands are sent.
+  Use exclusive access. Opening alone does not configure the radio.
 - Operations are lazy. A request cancelled after execution begins, a USB error,
   or incomplete framing poisons the session. Only shutdown is then allowed;
   reopen for further requests. Fully framed remote errors preserve the session.
-- `shutdown` closes pipe 0 and drops the device's USB ownership on success.
+- `shutdown` returns Busy while an RX stream handle exists. Otherwise it closes pipe 0 and drops the device's USB ownership on success.
   It is terminal once started, can be retried after failure, and is idempotent
   after success. Cached `info()` remains readable. Drop attempts cleanup but
   cannot report errors; native drop may block briefly, browser drop schedules
@@ -146,6 +205,7 @@ cargo test --target wasm32-unknown-unknown --lib --tests
 cargo test --test hardware -- --ignored --nocapture
 # Include native async lifecycle checks on the same device:
 cargo test --features smol --test hardware -- --ignored --nocapture
+cargo test --features smol --test rx_hardware -- --ignored --nocapture
 ```
 
 Tests cover all two-fragment splits of a context reply in blocking and async
@@ -155,3 +215,7 @@ parsing, and relocated/invalid endpoint layouts. The ignored hardware test
 checks repeated PRINT, explicit shutdown, drop cleanup, and reopen by serial.
 With `smol`, it runs both blocking and async lifecycle checks sequentially to
 avoid competing claims on the same USB interface.
+
+RX tests cover attribute framing and errors, fragmented READBUF chunks, masks,
+signed/endian sample conversion, buffer tails, exclusive stream ownership,
+stop/restart, active drop, and cancellation recovery. Hardware tests configure RX.
