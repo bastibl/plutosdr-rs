@@ -1,0 +1,39 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo test --all-targets --all-features
+      - run: cargo test --doc
+      - run: cargo check --target wasm32-unknown-unknown --all-targets --all-features
+      - run: cargo doc --no-deps --all-features
+  wasm-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install matching wasm-bindgen runner
+        shell: python
+        run: |
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1", "--locked"]))
+          version = next(p["version"] for p in metadata["packages"]
+                         if p["name"] == "wasm-bindgen")
+          subprocess.run(["cargo", "install", "wasm-bindgen-cli",
+                          "--version", version, "--locked"], check=True)
+      - name: Run WASM protocol tests under Node
+        run: cargo test --target wasm32-unknown-unknown --lib --tests

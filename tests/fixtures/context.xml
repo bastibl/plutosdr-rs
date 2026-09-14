@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE context [
+<!ELEMENT context (context-attribute | device)*>
+<!ELEMENT device (channel | attribute | debug-attribute | buffer-attribute)*>
+<!ELEMENT channel (scan-element?, attribute*)>
+<!ELEMENT scan-element EMPTY>
+<!ELEMENT attribute EMPTY>
+]>
+<context name="local" version-major="0" version-minor="26" version-git="fixture" description="Synthetic Pluto &amp; IIOD fixture">
+  <context-attribute name="hw_model" value="ADALM-PLUTO"/>
+  <device id="iio:device3" name="ad9361-phy">
+    <attribute name="ensm_mode"/>
+    <debug-attribute name="direct_reg_access"/>
+    <channel id="altvoltage0" type="output" name="RX_LO">
+      <attribute name="frequency" filename="out_altvoltage0_RX_LO_frequency"/>
+    </channel>
+    <channel id="voltage0" type="input">
+      <attribute name="sampling_frequency"/>
+      <attribute name="hardwaregain"/>
+    </channel>
+  </device>
+  <device id="iio:device7" name="cf-ad9361-lpc">
+    <buffer-attribute name="length"/>
+    <channel id="voltage0" type="input">
+      <scan-element index="0" format="le:S12/16&gt;&gt;0" scale="1.0"/>
+      <attribute name="offset"/>
+    </channel>
+    <channel id="voltage1" type="input">
+      <scan-element index="1" format="le:S12/16&gt;&gt;0"/>
+    </channel>
+  </device>
+  <device id="iio:device9" name="cf-ad9361-dds-core-lpc">
+    <channel id="voltage0" type="output"><scan-element index="0" format="le:S16/16&gt;&gt;0"/></channel>
+    <channel id="voltage1" type="output"><scan-element index="1" format="le:S16/16&gt;&gt;0"/></channel>
+  </device>
+</context>
