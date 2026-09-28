@@ -100,17 +100,29 @@ device.shutdown().wait()?;
 
 Controls include frequency (Hz), sample rate (samples/s), RF bandwidth (Hz),
 gain (dB), `GainMode::{Manual, SlowAttack, FastAttack, Hybrid}`, and RF port
-selection. Getters read hardware instead of returning requested values; AD936x
+selection, plus `dc_offset_enabled()` and `set_dc_offset_enabled(bool)` for
+RF and baseband DC tracking together. `dc_offset_available()` checks firmware
+support. Getters read hardware instead of returning requested values; AD936x
 clock rounding can change readback by a few Hz. `rx_range(RxAttribute::...)`
 queries firmware limits, including gain limits that change with LO frequency.
 `read_rx_attribute(attr, true)` also exposes available mode/port strings.
 Setting gain selects manual mode; failures may leave that mode applied. RX port
 names describe internal AD936x inputs, not extra physical Pluto connectors.
 
-No FIR filter loading or resampling is performed. With the connected firmware's
-FIR state, the minimum sample rate is 2,083,333 samples/s; 2 MS/s is rejected.
-Use the reported range for your firmware and current configuration. RX/TX
-sample clocks are related in the hardware; sample-rate changes can affect TX.
+Setting sample rate also sets analog RX bandwidth to the closest supported value
+to the actual sample-rate readback. Set bandwidth afterwards to override it.
+
+Sample-rate changes load and enable ADI RX/TX FIR profiles: 128 taps with x4
+decimation up to 20 MS/s, then x2 with 128/96/64 taps up to
+40/53.333333/61.44 MS/s. RX FIR gain is -6 dB.
+Configuration passes through 3 MS/s while replacing and enabling the FIR.
+The supported range is 520,834–61,440,000 samples/s; `rx_range(SampleRate)`
+reports this managed range, while `read_rx_attribute(SampleRate, true)` reports
+the firmware range for the currently active FIR. No host resampling or FPGA x8
+decimation is used; any stale FPGA decimation is reset. Rate changes replace
+custom FIR coefficients and affect both RX and TX through the shared clock chain.
+A failed configuration can leave earlier writes applied; stop streaming and
+retry configuration before using samples after an error.
 
 `rx_stream_with_buffer(samples)` selects the DMA block size (default 65,536
 complex frames). `read` converts signed scan words to normalized `Complex32`,

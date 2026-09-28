@@ -20,6 +20,32 @@ fn check_samples(samples: &[Complex32]) {
 #[ignore = "requires Pluto; configures RX at 2.45 GHz, 2.5 MS/s, 2 MHz bandwidth"]
 fn rx_configuration_streaming_and_recovery() -> Result<()> {
     let mut device = Device::open().wait()?;
+    assert!(device.dc_offset_available());
+    for enabled in [false, true] {
+        device.set_dc_offset_enabled(enabled).wait()?;
+        assert_eq!(device.dc_offset_enabled().wait()?, enabled);
+    }
+    // Cross every FIR profile boundary and return from a sub-2 MS/s rate.
+    for rate in [
+        3_200_000, 20_000_000, 32_000_000, 48_000_000, 61_440_000, 1_000_000, 3_200_000,
+    ] {
+        device.set_sample_rate_hz(rate).wait()?;
+        assert!(device.sample_rate_hz().wait()?.abs_diff(rate) < 5);
+        let available = device
+            .read_rx_attribute(plutosdr::RxAttribute::SampleRate, true)
+            .wait()?;
+        let range = plutosdr::ValueRange::parse(&available)?;
+        assert!(range.min < 1_100_000.0, "FIR must be enabled");
+        assert_eq!(
+            device.bandwidth_hz().wait()?,
+            device.sample_rate_hz().wait()?.min(56_000_000)
+        );
+    }
+
+    assert_eq!(
+        device.bandwidth_hz().wait()?,
+        device.sample_rate_hz().wait()?
+    );
     device.set_frequency_hz(2_450_000_000).wait()?;
     device.set_sample_rate_hz(2_500_000).wait()?;
     device.set_bandwidth_hz(2_000_000).wait()?;
@@ -100,6 +126,16 @@ fn rx_configuration_streaming_and_recovery() -> Result<()> {
 async fn async_checks() -> Result<()> {
     use std::future::IntoFuture;
     let mut device = Device::open().await?;
+    assert!(device.dc_offset_available());
+    for enabled in [false, true] {
+        device.set_dc_offset_enabled(enabled).await?;
+        assert_eq!(device.dc_offset_enabled().await?, enabled);
+    }
+    for rate in [32_000_000, 1_000_000, 3_200_000] {
+        device.set_sample_rate_hz(rate).await?;
+        assert!(device.sample_rate_hz().await?.abs_diff(rate) < 5);
+    }
+    assert_eq!(device.bandwidth_hz().await?, device.sample_rate_hz().await?);
     device.set_gain_db(25.0).await?;
     assert_eq!(device.gain_db().await?, 25.0);
     let mut rx = device.rx_stream_with_buffer(65536)?;

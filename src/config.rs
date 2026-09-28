@@ -1,6 +1,6 @@
 //! RX controls backed by the AD936x Linux IIO attributes.
 use crate::{
-    Device, Error, Result,
+    Device, Error, Result, baseband,
     iiod::{AttributeTarget, ChannelDirection},
     maybe_future::dual,
 };
@@ -86,6 +86,10 @@ pub enum RxAttribute {
     Gain,
     GainMode,
     Port,
+    /// Baseband DC offset tracking. Boolean; no `_available` attribute.
+    BbDcOffsetTracking,
+    /// RF DC offset tracking. Boolean; no `_available` attribute.
+    RfDcOffsetTracking,
 }
 impl RxAttribute {
     fn name(self) -> &'static str {
@@ -96,6 +100,8 @@ impl RxAttribute {
             Self::Gain => "hardwaregain",
             Self::GainMode => "gain_control_mode",
             Self::Port => "rf_port_select",
+            Self::BbDcOffsetTracking => "bb_dc_offset_tracking_en",
+            Self::RfDcOffsetTracking => "rf_dc_offset_tracking_en",
         }
     }
     pub(crate) fn target(self, device: &Device, available: bool) -> Result<AttributeTarget> {
@@ -159,16 +165,28 @@ impl Device {
         )
     }
 
-    /// Read an inclusive numeric range from firmware, without hardcoded model limits.
+    /// Read the supported setting range. Sample rate covers the FIR profiles
+    /// managed by this driver; other ranges come from firmware.
     pub fn rx_range(
         &mut self,
         attr: RxAttribute,
     ) -> impl MaybeFuture<Output = Result<ValueRange>> + '_ {
-        self.read_rx_attribute(attr, true)
-            .map(|s| ValueRange::parse(&s?))
+        self.read_rx_attribute(attr, true).map(move |s| {
+            if matches!(attr, RxAttribute::SampleRate) {
+                // Firmware only reports limits for the currently loaded FIR.
+                // Our setter switches profiles, including when leaving a low rate.
+                s?;
+                Ok(baseband::SAMPLE_RATE_RANGE)
+            } else {
+                ValueRange::parse(&s?)
+            }
+        })
     }
 
     /// Validated RX attribute write. Setting gain selects manual mode first.
+    /// Setting sample rate loads/enables the matching RX/TX FIR profile and
+    /// sets analog bandwidth to the closest supported
+    /// value to the actual rate. Set bandwidth afterwards to override it.
     /// A remote failure can leave earlier settings applied; query readback after errors.
     pub fn set_rx_attribute<'a>(
         &'a mut self,
@@ -179,30 +197,92 @@ impl Device {
         dual!(
             (self, attr, value),
             |(this, attr, value): (&mut Self, RxAttribute, String)| {
+                if matches!(attr, RxAttribute::SampleRate) {
+                    let rate = value
+                        .parse::<u32>()
+                        .map_err(|_| Error::InvalidConfig("expected integer sample rate"))?;
+                    let targets = baseband::Targets::from_context(this.info())?;
+                    let actual = baseband::configure(this.client_mut()?, targets, rate).wait()?;
+                    let range = this.rx_range(RxAttribute::Bandwidth).wait()?;
+                    let target = RxAttribute::Bandwidth.target(this, false)?;
+                    return this
+                        .client_mut()?
+                        .write_attr(&target, &bandwidth_for_rate(actual, range).to_string())
+                        .wait();
+                }
                 let target = attr.target(this, false)?;
-                validate_value(attr, &value, &this.read_rx_attribute(attr, true).wait()?)?;
+                let available = if matches!(
+                    attr,
+                    RxAttribute::BbDcOffsetTracking | RxAttribute::RfDcOffsetTracking
+                ) {
+                    "0 1".to_owned()
+                } else {
+                    this.read_rx_attribute(attr, true).wait()?
+                };
+                validate_value(attr, &value, &available)?;
                 if matches!(attr, RxAttribute::Gain) {
                     let mode = RxAttribute::GainMode.target(this, false)?;
                     this.client_mut()?.write_attr(&mode, "manual").wait()?;
                 }
-                this.client_mut()?.write_attr(&target, &value).wait()
+                this.client_mut()?.write_attr(&target, &value).wait()?;
+                Ok(())
             },
             |(this, attr, value): (&mut Self, RxAttribute, String)| async move {
+                if matches!(attr, RxAttribute::SampleRate) {
+                    let rate = value
+                        .parse::<u32>()
+                        .map_err(|_| Error::InvalidConfig("expected integer sample rate"))?;
+                    let targets = baseband::Targets::from_context(this.info())?;
+                    let actual = baseband::configure(this.client_mut()?, targets, rate).await?;
+                    let range = this.rx_range(RxAttribute::Bandwidth).await?;
+                    let target = RxAttribute::Bandwidth.target(this, false)?;
+                    return this
+                        .client_mut()?
+                        .write_attr(&target, &bandwidth_for_rate(actual, range).to_string())
+                        .await;
+                }
                 let target = attr.target(this, false)?;
-                validate_value(attr, &value, &this.read_rx_attribute(attr, true).await?)?;
+                let available = if matches!(
+                    attr,
+                    RxAttribute::BbDcOffsetTracking | RxAttribute::RfDcOffsetTracking
+                ) {
+                    "0 1".to_owned()
+                } else {
+                    this.read_rx_attribute(attr, true).await?
+                };
+                validate_value(attr, &value, &available)?;
                 if matches!(attr, RxAttribute::Gain) {
                     let mode = RxAttribute::GainMode.target(this, false)?;
                     this.client_mut()?.write_attr(&mode, "manual").await?;
                 }
-                this.client_mut()?.write_attr(&target, &value).await
+                this.client_mut()?.write_attr(&target, &value).await?;
+                Ok(())
             }
         )
     }
 }
 
+fn parse_bool(value: &str) -> Result<bool> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(Error::Protocol("invalid DC tracking value")),
+    }
+}
+
+fn bandwidth_for_rate(rate: u32, range: ValueRange) -> f64 {
+    let steps = ((f64::from(rate) - range.min) / range.step)
+        .round()
+        .clamp(0.0, ((range.max - range.min) / range.step).floor());
+    range.min + steps * range.step
+}
+
 fn validate_value(attr: RxAttribute, value: &str, available: &str) -> Result<()> {
     match attr {
-        RxAttribute::Port | RxAttribute::GainMode => {
+        RxAttribute::Port
+        | RxAttribute::GainMode
+        | RxAttribute::BbDcOffsetTracking
+        | RxAttribute::RfDcOffsetTracking => {
             if !available.split_whitespace().any(|v| v == value) {
                 return Err(Error::InvalidConfig("unsupported RX selection"));
             }
@@ -220,6 +300,62 @@ fn validate_value(attr: RxAttribute, value: &str, available: &str) -> Result<()>
 }
 
 impl Device {
+    /// Whether firmware advertises both RF and baseband DC tracking controls.
+    pub fn dc_offset_available(&self) -> bool {
+        RxAttribute::BbDcOffsetTracking.target(self, false).is_ok()
+            && RxAttribute::RfDcOffsetTracking.target(self, false).is_ok()
+    }
+
+    /// Read whether both RF and baseband DC offset tracking are enabled.
+    pub fn dc_offset_enabled(&mut self) -> impl MaybeFuture<Output = Result<bool>> + '_ {
+        dual!(
+            self,
+            |this: &mut Self| {
+                let bb = this
+                    .read_rx_attribute(RxAttribute::BbDcOffsetTracking, false)
+                    .wait()?;
+                let rf = this
+                    .read_rx_attribute(RxAttribute::RfDcOffsetTracking, false)
+                    .wait()?;
+                Ok(parse_bool(&bb)? && parse_bool(&rf)?)
+            },
+            |this: &mut Self| async move {
+                let bb = this
+                    .read_rx_attribute(RxAttribute::BbDcOffsetTracking, false)
+                    .await?;
+                let rf = this
+                    .read_rx_attribute(RxAttribute::RfDcOffsetTracking, false)
+                    .await?;
+                Ok(parse_bool(&bb)? && parse_bool(&rf)?)
+            }
+        )
+    }
+
+    /// Enable or disable both RF and baseband hardware DC offset tracking.
+    /// A remote failure may leave only one setting applied; query readback after errors.
+    pub fn set_dc_offset_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> impl MaybeFuture<Output = Result<()>> + '_ {
+        dual!(
+            (self, enabled),
+            |(this, enabled): (&mut Self, bool)| {
+                let bb = RxAttribute::BbDcOffsetTracking.target(this, false)?;
+                let rf = RxAttribute::RfDcOffsetTracking.target(this, false)?;
+                let value = if enabled { "1" } else { "0" };
+                this.client_mut()?.write_attr(&bb, value).wait()?;
+                this.client_mut()?.write_attr(&rf, value).wait()
+            },
+            |(this, enabled): (&mut Self, bool)| async move {
+                let bb = RxAttribute::BbDcOffsetTracking.target(this, false)?;
+                let rf = RxAttribute::RfDcOffsetTracking.target(this, false)?;
+                let value = if enabled { "1" } else { "0" };
+                this.client_mut()?.write_attr(&bb, value).await?;
+                this.client_mut()?.write_attr(&rf, value).await
+            }
+        )
+    }
+
     /// Read the actual RX LO frequency in Hz.
     pub fn frequency_hz(&mut self) -> impl MaybeFuture<Output = Result<u64>> + '_ {
         self.read_rx_attribute(RxAttribute::Frequency, false)
@@ -246,7 +382,9 @@ impl Device {
                     .map_err(|_| Error::Protocol("invalid RX value"))
             })
     }
-    /// Set the hardware sample rate without FIR loading or host resampling.
+    /// Load and enable the RX/TX FIR profile for this sample rate, then match
+    /// analog bandwidth to the actual readback within firmware limits. Changes
+    /// the shared RX/TX clock chain; no host resampling is performed.
     pub fn set_sample_rate_hz(&mut self, value: u32) -> impl MaybeFuture<Output = Result<()>> + '_ {
         self.set_rx_attribute(RxAttribute::SampleRate, &value.to_string())
     }
@@ -307,6 +445,28 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[cfg_attr(not(target_arch = "wasm32"), test)]
+    fn bandwidth_tracks_rate_within_firmware_limits() {
+        let range = ValueRange::parse("[200000 1 56000000]").unwrap();
+        for (rate, expected) in [
+            (100_000, 200_000.0),
+            (3_200_001, 3_200_001.0),
+            (61_440_000, 56_000_000.0),
+        ] {
+            let bandwidth = bandwidth_for_rate(rate, range);
+            assert_eq!(bandwidth, expected);
+            assert!(range.contains(bandwidth));
+        }
+        let stepped = ValueRange::parse("[200000 100000 550000]").unwrap();
+        assert_eq!(bandwidth_for_rate(360_000, stepped), 400_000.0);
+        assert_eq!(bandwidth_for_rate(600_000, stepped), 500_000.0);
+        assert!(!parse_bool("0").unwrap());
+        assert!(parse_bool("1").unwrap());
+        assert!(parse_bool("2").is_err());
+        assert!(validate_value(RxAttribute::BbDcOffsetTracking, "true", "0 1").is_err());
+    }
+
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     #[cfg_attr(not(target_arch = "wasm32"), test)]
     fn ranges_and_settings_reject_invalid_values() {

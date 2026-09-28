@@ -17,6 +17,7 @@
 //! # }
 //! ```
 
+mod baseband;
 mod config;
 mod device;
 mod error;
