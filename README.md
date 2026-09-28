@@ -223,6 +223,28 @@ on unrelated composite functions.
   racing old requests. A stalled device can keep that cleanup pending until
   disconnection; prefer awaiting `stop`/`shutdown`.
 
+## Publishing
+
+The [release workflow](.github/workflows/release.yml) runs on pushed `v*` tags.
+It requires the tag to equal `v` followed by the package version in `Cargo.toml`,
+runs native and WASM checks, verifies the crate package, publishes to crates.io,
+and creates a GitHub release with generated notes. It uses the checked-in
+`Cargo.lock` throughout.
+
+Before the first release, choose a license and add its metadata and license
+files. The repository currently does not declare one. The initial crates.io
+publication requires an API token; subsequent releases can use
+[Trusted Publishing](https://crates.io/docs/trusted-publishing).
+Configure the crate's trusted publisher on crates.io with owner `bastibl`,
+repository `plutosdr-rs`, workflow filename `release.yml`, and no environment.
+This workflow obtains a short-lived token through GitHub OIDC, matching
+`hackrf-rs`; it does not use a stored crates.io token.
+
+After the initial publication and trusted-publisher setup, update the package
+version and lockfile, commit the changes, and push the matching version tag to
+`github` to release a new version. Tags for a version already on crates.io will
+fail at publishing; crate versions cannot be overwritten.
+
 ## Checks
 
 ```sh

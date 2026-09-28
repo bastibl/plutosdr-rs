@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Validate and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Validate tag matches crate version
+        shell: python
+        run: |
+          import os, tomllib
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag} does not match crate version {version}")
+
+      - name: Check format
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run Clippy with all features
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run no-hardware tests
+        run: cargo test --locked --all-targets
+
+      - name: Run no-hardware tests with all features
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Run doc tests
+        run: cargo test --locked --doc
+
+      - name: Run doc tests with all features
+        run: cargo test --locked --doc --all-features
+
+      - name: Check WebUSB target
+        run: cargo check --locked --target wasm32-unknown-unknown --all-targets --all-features
+
+      - name: Install matching wasm-bindgen runner
+        shell: python
+        run: |
+          import json, subprocess
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--format-version", "1", "--locked"]))
+          version = next(p["version"] for p in metadata["packages"]
+                         if p["name"] == "wasm-bindgen")
+          subprocess.run(["cargo", "install", "wasm-bindgen-cli",
+                          "--version", version, "--locked"], check=True)
+
+      - name: Run WASM protocol and WebUSB mock tests under Node
+        run: cargo test --locked --target wasm32-unknown-unknown --lib --tests
+
+      - name: Check public API docs
+        run: cargo doc --locked --no-deps --all-features
+
+      - name: Package crate
+        run: cargo package --locked
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
