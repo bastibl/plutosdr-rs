@@ -8,6 +8,10 @@ complex RX stream. The driver claims the named `IIO` FunctionFS interface and
 uses independent control and streaming bulk endpoint pairs. TX is not implemented.
 See [the source-based protocol notes](docs/protocol.md) for wire details.
 
+This is an experimental initial release; the API may change. See
+[release notes](CHANGELOG.md) for supported features and qualification limits.
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
 The API follows `hackrf-rs`: `Device`, `DeviceBuilder`, discovery descriptors,
 and operations with native `.wait()` or native/browser `.await`. All IIOD/XML
 code is shared; USB code handles interface ownership and platform differences.
@@ -37,7 +41,10 @@ async paths passed 100 context refreshes across 10 open/close cycles each,
 including explicit shutdown and drop cleanup. See the
 [hardware results](docs/protocol.md#hardware-validation-2026-09-14).
 RX configuration, capture, cancellation, and restart were subsequently verified
-on firmware v0.39 / IIO v0.26. WebUSB hardware access remains unverified. The XML unit-test fixture is synthetic, not a device capture.
+on firmware v0.39 / IIO v0.26. Chrome/WebUSB reception and live gain/channel
+changes were hardware-verified on 2026-09-28 through the FutureSDR WLAN receiver;
+see [browser hardware results](docs/protocol.md#browser-hardware-validation-2026-09-28).
+The XML unit-test fixture is synthetic, not a device capture.
 
 ## Native blocking
 
@@ -231,9 +238,7 @@ runs native and WASM checks, verifies the crate package, publishes to crates.io,
 and creates a GitHub release with generated notes. It uses the checked-in
 `Cargo.lock` throughout.
 
-Before the first release, choose a license and add its metadata and license
-files. The repository currently does not declare one. The initial crates.io
-publication requires an API token; subsequent releases can use
+The initial crates.io publication requires an API token; subsequent releases can use
 [Trusted Publishing](https://crates.io/docs/trusted-publishing).
 Configure the crate's trusted publisher on crates.io with owner `bastibl`,
 repository `plutosdr-rs`, workflow filename `release.yml`, and no environment.

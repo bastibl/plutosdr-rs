@@ -402,3 +402,19 @@ specialized and generic sample conversion. WebUSB tests run the production nusb
 endpoint path with delayed JavaScript mocks, checking four recycled buffers,
 borrowed payload delivery, callback failure and cancellation cleanup. Browser
 hardware throughput remains a separate measurement.
+
+## Browser hardware validation (2026-09-28)
+
+The release-mode FutureSDR `examples/wlan-wasm` application was served locally
+with COOP/COEP headers and run in Google Chrome on Linux with a connected Pluto.
+Seify automatically selected the already-authorized Pluto through WebUSB.
+RX used the 20 MHz sample clock, 20 MHz bandwidth, and default 65,536-sample
+driver buffer. The application decoded more than 100 real WLAN frames.
+Live manual gain changed from 50 to 45 dB, and channel changed from 11 to 6;
+the receiver remained running and decoded additional frames after reconfiguration.
+The Seify source stops and restarts RX around these changes.
+
+This establishes browser hardware reception and control, not lossless 20 MS/s
+capture or a measured browser sample throughput. Native blocking and async
+hardware lifecycle/recovery checks were also rerun successfully on this date.
+No ambient frame contents or network identifiers are stored in this repository.

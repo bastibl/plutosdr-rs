@@ -3,6 +3,16 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  msrv:
+    name: Rust 1.88 minimum supported version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo check --locked --target wasm32-unknown-unknown --all-targets --all-features
   check:
     runs-on: ubuntu-latest
     steps:
