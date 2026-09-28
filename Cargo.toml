@@ -35,3 +35,7 @@ required-features = ["smol"]
 [[example]]
 name = "rx_async"
 required-features = ["smol"]
+
+[[example]]
+name = "rx_benchmark"
+required-features = ["smol"]

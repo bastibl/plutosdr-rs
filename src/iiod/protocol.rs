@@ -22,7 +22,82 @@ pub trait Transport: PlatformSend {
     /// Deliver a length-delimited attribute payload as one complete write.
     fn write_data(&mut self, data: &[u8]) -> impl MaybeFuture<Output = Result<()>>;
     fn read(&mut self, max_bytes: usize) -> impl MaybeFuture<Output = Result<Vec<u8>>>;
+    /// Consume exactly `length` bytes in ordered, arbitrary-sized chunks.
+    /// The callback must not retain its slice. A failure leaves the connection
+    /// unusable. Transports retain bytes beyond the announced payload boundary.
+    fn consume_exact<F>(
+        &mut self,
+        length: usize,
+        consume: F,
+    ) -> impl MaybeFuture<Output = Result<()>>
+    where
+        F: FnMut(&[u8]) -> Result<()> + PlatformSend,
+    {
+        dual!(
+            (self, length, consume),
+            |(this, mut remaining, mut consume): (&mut Self, usize, F)| {
+                while remaining != 0 {
+                    let bytes = this.read(remaining.min(65536)).wait()?;
+                    if bytes.is_empty() || bytes.len() > remaining {
+                        return Err(Error::Protocol("invalid transport read length"));
+                    }
+                    consume(&bytes)?;
+                    remaining -= bytes.len();
+                }
+                Ok(())
+            },
+            |(this, mut remaining, mut consume): (&mut Self, usize, F)| async move {
+                while remaining != 0 {
+                    let bytes = this.read(remaining.min(65536)).await?;
+                    if bytes.is_empty() || bytes.len() > remaining {
+                        return Err(Error::Protocol("invalid transport read length"));
+                    }
+                    consume(&bytes)?;
+                    remaining -= bytes.len();
+                }
+                Ok(())
+            }
+        )
+    }
+    /// Fill initialized storage, using the same bounded transfer queue.
+    fn read_exact<'a>(
+        &'a mut self,
+        output: &'a mut [u8],
+    ) -> impl MaybeFuture<Output = Result<()>> + 'a {
+        let mut offset = 0;
+        self.consume_exact(output.len(), move |bytes| {
+            output[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+            Ok(())
+        })
+    }
     fn shutdown(&mut self) -> impl MaybeFuture<Output = Result<()>>;
+}
+
+/// Validated once per RX stream; command and mask allocations are reused.
+pub(crate) struct ReadRequest {
+    command: String,
+    length: usize,
+    mask: String,
+}
+impl ReadRequest {
+    pub(crate) fn new(device: &str, length: usize, mask: &str) -> Result<Self> {
+        super::attribute::token(device)?;
+        if length == 0
+            || length > 16 * 1024 * 1024
+            || mask.is_empty()
+            || mask.len() > 128
+            || !mask.len().is_multiple_of(8)
+            || !mask.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(Error::InvalidConfig("invalid RX buffer request"));
+        }
+        Ok(Self {
+            command: format!("READBUF {device} {length}\r\n"),
+            length,
+            mask: mask.into(),
+        })
+    }
 }
 
 /// Serialized ASCII client owning one transport, usable with native wait or await.
@@ -31,6 +106,7 @@ pub struct IiodClient<T: Transport> {
     pending: VecDeque<u8>,
     poisoned: bool,
     closed: bool,
+    read_pending: bool,
 }
 
 impl<T: Transport> IiodClient<T> {
@@ -40,6 +116,7 @@ impl<T: Transport> IiodClient<T> {
             pending: VecDeque::new(),
             poisoned: false,
             closed: false,
+            read_pending: false,
         }
     }
 
@@ -213,22 +290,25 @@ impl<T: Transport> IiodClient<T> {
         dual!(
             self,
             |this: &mut Self| {
-                let mut line = Vec::new();
+                let mut storage = [0; MAX_LINE_BYTES];
+                let mut length = 0;
                 loop {
-                    let byte = this.exact(1).wait()?[0];
+                    let mut byte = [0];
+                    this.exact_into(&mut byte).wait()?;
+                    let byte = byte[0];
                     if byte == b'\n' {
                         break;
                     }
-                    if line.len() >= MAX_LINE_BYTES {
+                    if length >= MAX_LINE_BYTES {
                         return Err(Error::Protocol("response line too long"));
                     }
-                    line.push(byte);
+                    storage[length] = byte;
+                    length += 1;
                 }
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
+                let line = &storage[..length];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
                 let text =
-                    std::str::from_utf8(&line).map_err(|_| Error::Protocol("invalid integer"))?;
+                    std::str::from_utf8(line).map_err(|_| Error::Protocol("invalid integer"))?;
                 let digits = text.strip_prefix('-').unwrap_or(text);
                 if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(Error::Protocol("invalid integer"));
@@ -237,22 +317,25 @@ impl<T: Transport> IiodClient<T> {
                     .map_err(|_| Error::Protocol("integer overflow"))
             },
             |this: &mut Self| async move {
-                let mut line = Vec::new();
+                let mut storage = [0; MAX_LINE_BYTES];
+                let mut length = 0;
                 loop {
-                    let byte = this.exact(1).await?[0];
+                    let mut byte = [0];
+                    this.exact_into(&mut byte).await?;
+                    let byte = byte[0];
                     if byte == b'\n' {
                         break;
                     }
-                    if line.len() >= MAX_LINE_BYTES {
+                    if length >= MAX_LINE_BYTES {
                         return Err(Error::Protocol("response line too long"));
                     }
-                    line.push(byte);
+                    storage[length] = byte;
+                    length += 1;
                 }
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
+                let line = &storage[..length];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
                 let text =
-                    std::str::from_utf8(&line).map_err(|_| Error::Protocol("invalid integer"))?;
+                    std::str::from_utf8(line).map_err(|_| Error::Protocol("invalid integer"))?;
                 let digits = text.strip_prefix('-').unwrap_or(text);
                 if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(Error::Protocol("invalid integer"));
@@ -262,41 +345,39 @@ impl<T: Transport> IiodClient<T> {
             }
         )
     }
+    fn exact_into<'a>(
+        &'a mut self,
+        output: &'a mut [u8],
+    ) -> impl MaybeFuture<Output = Result<()>> + 'a {
+        dual!(
+            (self, output),
+            |(this, output): (&mut Self, &mut [u8])| {
+                let n = output.len().min(this.pending.len());
+                for (dest, byte) in output[..n].iter_mut().zip(this.pending.drain(..n)) {
+                    *dest = byte;
+                }
+                this.transport.read_exact(&mut output[n..]).wait()
+            },
+            |(this, output): (&mut Self, &mut [u8])| async move {
+                let n = output.len().min(this.pending.len());
+                for (dest, byte) in output[..n].iter_mut().zip(this.pending.drain(..n)) {
+                    *dest = byte;
+                }
+                this.transport.read_exact(&mut output[n..]).await
+            }
+        )
+    }
     fn exact(&mut self, length: usize) -> impl MaybeFuture<Output = Result<Vec<u8>>> + '_ {
         dual!(
             (self, length),
             |(this, length): (&mut Self, usize)| {
-                let mut bytes = Vec::with_capacity(length);
-                while bytes.len() < length {
-                    let count = this.pending.len().min(length - bytes.len());
-                    bytes.extend(this.pending.drain(..count));
-                    if bytes.len() == length {
-                        break;
-                    }
-                    let max = (length - bytes.len()).min(256 * 1024);
-                    let chunk = this.transport.read(max).wait()?;
-                    if chunk.is_empty() || chunk.len() > max {
-                        return Err(Error::Protocol("invalid transport read length"));
-                    }
-                    bytes.extend(chunk);
-                }
+                let mut bytes = vec![0; length];
+                this.exact_into(&mut bytes).wait()?;
                 Ok(bytes)
             },
             |(this, length): (&mut Self, usize)| async move {
-                let mut bytes = Vec::with_capacity(length);
-                while bytes.len() < length {
-                    let count = this.pending.len().min(length - bytes.len());
-                    bytes.extend(this.pending.drain(..count));
-                    if bytes.len() == length {
-                        break;
-                    }
-                    let max = (length - bytes.len()).min(256 * 1024);
-                    let chunk = this.transport.read(max).await?;
-                    if chunk.is_empty() || chunk.len() > max {
-                        return Err(Error::Protocol("invalid transport read length"));
-                    }
-                    bytes.extend(chunk);
-                }
+                let mut bytes = vec![0; length];
+                this.exact_into(&mut bytes).await?;
                 Ok(bytes)
             }
         )
@@ -310,23 +391,110 @@ impl<T: Transport> IiodClient<T> {
         dual!(
             (self, device.to_owned(), length, mask.to_owned()),
             |(this, device, length, mask): (&mut Self, String, usize, String)| {
-                super::attribute::token(&device)?;
-                if length == 0
-                    || length > 16 * 1024 * 1024
-                    || mask.is_empty()
-                    || mask.len() > 128
-                    || !mask.len().is_multiple_of(8)
-                    || !mask.bytes().all(|b| b.is_ascii_hexdigit())
-                {
-                    return Err(Error::InvalidConfig("invalid RX buffer request"));
-                }
+                let mut data = Vec::new();
+                this.read_buffer_into(&device, length, &mask, &mut data)
+                    .wait()?;
+                Ok(data)
+            },
+            |(this, device, length, mask): (&mut Self, String, usize, String)| async move {
+                let mut data = Vec::new();
+                this.read_buffer_into(&device, length, &mask, &mut data)
+                    .await?;
+                Ok(data)
+            }
+        )
+    }
+    /// Refill reusable byte storage. On error or cancellation, its contents
+    /// are incomplete and must not be consumed as samples.
+    pub fn read_buffer_into<'a>(
+        &'a mut self,
+        device: &str,
+        length: usize,
+        mask: &str,
+        data: &'a mut Vec<u8>,
+    ) -> impl MaybeFuture<Output = Result<()>> + 'a {
+        dual!(
+            (self, ReadRequest::new(device, length, mask), data),
+            |(this, request, data): (&mut Self, Result<ReadRequest>, &mut Vec<u8>)| {
+                let request = request?;
+                data.clear();
+                this.read_chunks(&request, |bytes| {
+                    data.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .wait()?;
+                Ok(())
+            },
+            |(this, request, data): (&mut Self, Result<ReadRequest>, &mut Vec<u8>)| async move {
+                let request = request?;
+                data.clear();
+                this.read_chunks(&request, |bytes| {
+                    data.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .await?;
+                Ok(())
+            }
+        )
+    }
+
+    pub(crate) fn rx_usable(&self) -> bool {
+        !self.closed && (!self.poisoned || self.read_pending)
+    }
+
+    /// Issue at most one read ahead. No speculative bulk IN crosses an
+    /// unparsed response boundary. Only read_chunks or shutdown may follow.
+    pub(crate) fn prefetch<'a>(
+        &'a mut self,
+        request: &'a ReadRequest,
+    ) -> impl MaybeFuture<Output = Result<()>> + 'a {
+        dual!(
+            (self, request),
+            |(this, request): (&mut Self, &ReadRequest)| {
                 this.begin()?;
                 this.transport
-                    .write_command(format!("READBUF {device} {length}\r\n").as_bytes())
+                    .write_command(request.command.as_bytes())
                     .wait()?;
-                let mut data = Vec::with_capacity(length);
+                this.read_pending = true;
+                Ok(())
+            },
+            |(this, request): (&mut Self, &ReadRequest)| async move {
+                this.begin()?;
+                this.transport
+                    .write_command(request.command.as_bytes())
+                    .await?;
+                this.read_pending = true;
+                Ok(())
+            }
+        )
+    }
+
+    pub(crate) fn read_chunks<'a, F>(
+        &'a mut self,
+        request: &'a ReadRequest,
+        consume: F,
+    ) -> impl MaybeFuture<Output = Result<usize>> + 'a
+    where
+        F: FnMut(&[u8]) -> Result<()> + PlatformSend + 'a,
+    {
+        dual!(
+            (self, request, consume),
+            |(this, request, mut consume): (&mut Self, &ReadRequest, F)| {
+                if this.closed {
+                    return Err(Error::DeviceClosed);
+                }
+                if this.read_pending {
+                    // Taking the response makes cancellation poison the session.
+                    this.read_pending = false;
+                } else {
+                    this.begin()?;
+                    this.transport
+                        .write_command(request.command.as_bytes())
+                        .wait()?;
+                }
+                let mut received = 0;
                 let mut first = true;
-                while data.len() < length {
+                while received < request.length {
                     let count = this.integer().wait()?;
                     if count < 0 {
                         this.poisoned = false;
@@ -336,41 +504,54 @@ impl<T: Transport> IiodClient<T> {
                         break;
                     }
                     let count = count as usize;
-                    if count > length - data.len() {
+                    if count > request.length - received {
                         return Err(Error::Protocol("RX chunk exceeds requested length"));
                     }
                     if first {
-                        let actual = this.exact(mask.len() + 1).wait()?;
-                        if actual.last() != Some(&b'\n')
-                            || !actual[..mask.len()].eq_ignore_ascii_case(mask.as_bytes())
+                        let mut mask = [0; 129];
+                        let mask = &mut mask[..request.mask.len() + 1];
+                        this.exact_into(mask).wait()?;
+                        if mask.last() != Some(&b'\n')
+                            || !mask[..mask.len() - 1].eq_ignore_ascii_case(request.mask.as_bytes())
                         {
                             return Err(Error::Protocol("RX channel mask changed"));
                         }
                         first = false;
                     }
-                    data.extend(this.exact(count).wait()?);
+                    let buffered = count.min(this.pending.len());
+                    let (a, b) = this.pending.as_slices();
+                    let n = buffered.min(a.len());
+                    if n != 0 {
+                        consume(&a[..n])?;
+                    }
+                    if buffered > n {
+                        consume(&b[..buffered - n])?;
+                    }
+                    this.pending.drain(..buffered);
+                    this.transport
+                        .consume_exact(count - buffered, &mut consume)
+                        .wait()?;
+                    received += count;
                 }
                 this.poisoned = false;
-                Ok(data)
+                Ok(received)
             },
-            |(this, device, length, mask): (&mut Self, String, usize, String)| async move {
-                super::attribute::token(&device)?;
-                if length == 0
-                    || length > 16 * 1024 * 1024
-                    || mask.is_empty()
-                    || mask.len() > 128
-                    || !mask.len().is_multiple_of(8)
-                    || !mask.bytes().all(|b| b.is_ascii_hexdigit())
-                {
-                    return Err(Error::InvalidConfig("invalid RX buffer request"));
+            |(this, request, mut consume): (&mut Self, &ReadRequest, F)| async move {
+                if this.closed {
+                    return Err(Error::DeviceClosed);
                 }
-                this.begin()?;
-                this.transport
-                    .write_command(format!("READBUF {device} {length}\r\n").as_bytes())
-                    .await?;
-                let mut data = Vec::with_capacity(length);
+                if this.read_pending {
+                    // Taking the response makes cancellation poison the session.
+                    this.read_pending = false;
+                } else {
+                    this.begin()?;
+                    this.transport
+                        .write_command(request.command.as_bytes())
+                        .await?;
+                }
+                let mut received = 0;
                 let mut first = true;
-                while data.len() < length {
+                while received < request.length {
                     let count = this.integer().await?;
                     if count < 0 {
                         this.poisoned = false;
@@ -380,22 +561,37 @@ impl<T: Transport> IiodClient<T> {
                         break;
                     }
                     let count = count as usize;
-                    if count > length - data.len() {
+                    if count > request.length - received {
                         return Err(Error::Protocol("RX chunk exceeds requested length"));
                     }
                     if first {
-                        let actual = this.exact(mask.len() + 1).await?;
-                        if actual.last() != Some(&b'\n')
-                            || !actual[..mask.len()].eq_ignore_ascii_case(mask.as_bytes())
+                        let mut mask = [0; 129];
+                        let mask = &mut mask[..request.mask.len() + 1];
+                        this.exact_into(mask).await?;
+                        if mask.last() != Some(&b'\n')
+                            || !mask[..mask.len() - 1].eq_ignore_ascii_case(request.mask.as_bytes())
                         {
                             return Err(Error::Protocol("RX channel mask changed"));
                         }
                         first = false;
                     }
-                    data.extend(this.exact(count).await?);
+                    let buffered = count.min(this.pending.len());
+                    let (a, b) = this.pending.as_slices();
+                    let n = buffered.min(a.len());
+                    if n != 0 {
+                        consume(&a[..n])?;
+                    }
+                    if buffered > n {
+                        consume(&b[..buffered - n])?;
+                    }
+                    this.pending.drain(..buffered);
+                    this.transport
+                        .consume_exact(count - buffered, &mut consume)
+                        .await?;
+                    received += count;
                 }
                 this.poisoned = false;
-                Ok(data)
+                Ok(received)
             }
         )
     }
@@ -897,13 +1093,41 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn refill_reuses_storage_and_retains_response_boundaries() {
+        for asynchronous in [false, true] {
+            let mut client = IiodClient::new(Script::new([
+                b"4\n00000003\nABCD4\nEFGH4\n00000003\nIJKL0\n".to_vec(),
+            ]));
+            let mut data = Vec::with_capacity(1024);
+            let allocation = data.as_ptr();
+            run(
+                client.read_buffer_into("iio:device7", 8, "00000003", &mut data),
+                asynchronous,
+            )
+            .unwrap();
+            assert_eq!(&data, b"ABCDEFGH");
+            assert_eq!(data.as_ptr(), allocation);
+            run(
+                client.read_buffer_into("iio:device7", 8, "00000003", &mut data),
+                asynchronous,
+            )
+            .unwrap();
+            assert_eq!(&data, b"IJKL");
+            assert_eq!(data.as_ptr(), allocation);
+            assert!(client.usable());
+        }
+    }
+
     async fn cancel_rx_after_header() {
         let mut script = Script::new([b"4\n00000003\nAB".to_vec()]);
         script.reads.push_back(Read::Pending);
         let mut client = IiodClient::new(script);
+        let mut storage = Vec::with_capacity(4);
         let mut read = Box::pin(
             client
-                .read_buffer("iio:device7", 4, "00000003")
+                .read_buffer_into("iio:device7", 4, "00000003", &mut storage)
                 .into_future(),
         );
         assert!(
@@ -917,6 +1141,74 @@ mod tests {
             Err(Error::SessionPoisoned)
         ));
         client.shutdown().await.unwrap();
+    }
+
+    async fn read_ahead_lifecycle() {
+        let request = ReadRequest::new("iio:device7", 4, "00000003").unwrap();
+        let mut client =
+            IiodClient::new(Script::new(
+                [b"4\n00000003\nABCD4\n00000003\nEFGH".to_vec()],
+            ));
+        drop(client.prefetch(&request).into_future());
+        assert!(client.transport.commands.is_empty());
+        client.prefetch(&request).await.unwrap();
+        assert!(client.rx_usable());
+        assert!(!client.usable());
+        assert!(matches!(
+            client.prefetch(&request).await,
+            Err(Error::SessionPoisoned)
+        ));
+        assert!(matches!(
+            client.context().await,
+            Err(Error::SessionPoisoned)
+        ));
+        for expected in [b"ABCD", b"EFGH"] {
+            let mut bytes = Vec::new();
+            let count = client
+                .read_chunks(&request, |b| {
+                    bytes.extend_from_slice(b);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(count, 4);
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(client.transport.commands.len(), 2);
+        client.prefetch(&request).await.unwrap();
+        client.shutdown().await.unwrap();
+        assert!(matches!(
+            client.read_chunks(&request, |_| Ok(())).await,
+            Err(Error::DeviceClosed)
+        ));
+
+        let mut script = Script::new([b"4\n00000003\nAB".to_vec()]);
+        script.reads.push_back(Read::Pending);
+        let mut client = IiodClient::new(script);
+        client.prefetch(&request).await.unwrap();
+        let mut read = Box::pin(client.read_chunks(&request, |_| Ok(())).into_future());
+        assert!(
+            futures_lite::future::poll_once(read.as_mut())
+                .await
+                .is_none()
+        );
+        drop(read);
+        assert!(!client.rx_usable());
+        assert!(matches!(
+            client.read_chunks(&request, |_| Ok(())).await,
+            Err(Error::SessionPoisoned)
+        ));
+        client.shutdown().await.unwrap();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn prefetched_read_is_bounded_and_cancellation_poisons_it() {
+        futures_lite::future::block_on(read_ahead_lifecycle());
+    }
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    async fn wasm_prefetched_read_is_bounded_and_cancellation_poisons_it() {
+        read_ahead_lifecycle().await;
     }
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

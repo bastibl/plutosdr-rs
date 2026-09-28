@@ -119,9 +119,37 @@ a replacement handle. Control requests use pipe 0 while RX uses pipe 1, so they
 can run concurrently. Retuning/reconfiguring while RX is active can mix old and
 new settings in buffered data; stop/restart when that distinction matters.
 
-This is bounded, pull-based RX. There is no background host queue, timestamping,
-or reliable sample-loss indication in this legacy exchange. Sustained throughput
-and sample continuity at the maximum advertised rate are not guaranteed.
+RX queues up to four 64 KiB bulk-IN transfers inside each announced IIOD
+payload, in blocking, async, and WebUSB modes. Completed USB buffers are decoded
+directly into the caller's `Complex32` buffer and recycled. Full-buffer reads
+need no raw payload staging copy or zero-fill; only overflow from smaller caller
+buffers is copied into reusable tail storage. Requests remain bounded by the payload length, including short packets
+and ZLPs, so no speculative transfer consumes the next IIOD response.
+
+Each successful refill sends one READBUF ahead so Pluto can prepare the next
+buffer while the caller processes samples. Its header is parsed and bulk-IN
+reads are submitted on the next refill call; there is no background host task.
+Stop closes the pipe to discard an outstanding read-ahead response. Discard the
+output slice on a failed or cancelled read because decoding occurs in place.
+There is no timestamping or reliable sample-loss indication in this legacy
+exchange. Sustained throughput and sample continuity at the maximum advertised
+rate are not guaranteed.
+
+To measure the driver without DSP, at a 20 MS/s hardware clock:
+
+```sh
+cargo run --release --features smol --example rx_benchmark -- async
+cargo run --release --features smol --example rx_benchmark -- blocking
+# A larger DMA buffer amortizes IIOD requests, at the cost of latency:
+cargo run --release --features smol --example rx_benchmark -- async 262144
+```
+
+On the connected Pluto, the initial transfer queue raised native async throughput
+from 4.70 to 6.16 MS/s. Direct decoding and read ahead now deliver 7.1–7.2 MS/s
+with the default 65,536-sample buffer; a 262,144-sample buffer reached 7.64 MS/s.
+These are delivered sample rates, not continuity guarantees or browser results.
+See [protocol notes](docs/protocol.md#direct-decoding-and-bounded-read-ahead) for
+paired measurements and remaining costs.
 
 ## Native async
 
@@ -189,7 +217,11 @@ on unrelated composite functions.
   execution modes. Native pipe control and string requests use one second.
   nusb/WebUSB ignores control-transfer timeouts; browser control operations are
   bounded by the browser, not by that native timeout. WebUSB cannot cancel a
-  submitted bulk transfer; never reuse a cancelled session.
+  submitted bulk transfer. Explicit shutdown drains queued requests before
+  closing the pipe. Browser Drop retains the endpoint claims while background
+  cleanup settles abandoned transfers, preventing replacement queues from
+  racing old requests. A stalled device can keep that cleanup pending until
+  disconnection; prefer awaiting `stop`/`shutdown`.
 
 ## Checks
 
@@ -219,3 +251,6 @@ avoid competing claims on the same USB interface.
 RX tests cover attribute framing and errors, fragmented READBUF chunks, masks,
 signed/endian sample conversion, buffer tails, exclusive stream ownership,
 stop/restart, active drop, and cancellation recovery. Hardware tests configure RX.
+WebUSB tests run production nusb endpoints against delayed JavaScript USB
+completions, verifying queue depth, short packets, ZLPs, preserved trailing
+responses, cancellation draining, and endpoint ownership during Drop.

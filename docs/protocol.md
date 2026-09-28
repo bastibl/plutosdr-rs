@@ -300,3 +300,105 @@ The AD936x range/mode mapping also follows
 [`ad9361.c`](https://github.com/analogdevicesinc/linux/blob/main/drivers/iio/adc/ad9361.c),
 functions `ad9361_phy_read_avail` and `ad9361_phy_lo_read`, and the
 `ad9361_phy_ext_info` / RX port and AGC enum tables.
+
+## Queued RX payload transfers (2026-09-14)
+
+The HackRF reference uses `DirectRxStream` / `AsyncDirectRxStream` in
+`~/src/hackrf-rs/src/streaming.rs` to keep bulk transfers queued and recycle
+completed buffers. Pluto now shares these architectural properties, with a
+protocol-specific boundary: a READBUF chunk's positive byte count must be
+parsed before its payload reads can be queued.
+
+`Transport::consume_exact` delivers a known-length payload through borrowed
+chunks; its generic implementation uses ordinary short reads, while
+`NusbTransport` queues up to four 64 KiB reads. `read_exact` is a copying adapter
+for callers that need contiguous byte storage.
+The sum of outstanding requested bytes stays within the remaining payload.
+Short completions and ZLPs free their unused reservation for replacement reads.
+Only the final partial USB packet is rounded up, after older reads finish; any
+surplus is retained for the next response. Successful completion therefore
+leaves no outstanding IN requests. This avoids speculative reads hanging at an
+IIOD command boundary, particularly on WebUSB where cancellation is unavailable.
+
+The nusb source reference is `Endpoint::{allocate,submit,next_complete,
+wait_next_complete}` in `nusb-0.2.7/src/device.rs`. Its WebUSB `submit` immediately
+calls JavaScript `transferIn`, so queueing four transfers creates four actual
+browser requests before awaiting the first completion. Completion buffers are
+recycled. `IiodClient::read_chunks` passes borrowed completions to `RxStream`,
+which decodes into caller output. `read_buffer_into` remains available as a
+contiguous-storage adapter.
+
+Cancellation still poisons the IIOD session. Explicit async shutdown drains
+already-submitted reads before closing the pipe. Browser Drop holds the endpoint
+objects through background cleanup so another stream cannot reuse them while
+old browser requests remain outstanding. The FunctionFS close operation stops
+the pipe's interpreter (`usb_close_pipe` / `usbd_client_thread` in upstream
+`iiod/usbd.c`); it is not a substitute for host-side completion ownership.
+
+Five-second native release benchmarks at a 20 MS/s hardware clock, 2.462 GHz,
+50 dB gain, without DSP (same hardware and saved pre-change executable):
+
+| Mode | DMA buffer, complex samples | Before, MS/s | Queued/reused buffers, MS/s |
+| --- | ---: | ---: | ---: |
+| Async | 65,536 | 4.70 | 6.16 |
+| Blocking | 65,536 | 5.13 | 6.40 |
+| Async | 262,144 | 5.21 | 6.71 |
+
+The default buffer size remains 65,536 to preserve latency. These results include
+sample conversion and do not establish lossless capture at the hardware clock.
+Native hardware checks passed cancellation, timeout recovery, stop/restart,
+small-output tails, concurrent control and active Drop. Production WebUSB queue
+behavior is checked with delayed mock JavaScript USB transfers under Node;
+actual browser hardware throughput must be measured separately.
+
+## Direct decoding and bounded read ahead
+
+The next optimization pass removes the intermediate raw payload from full-buffer
+RX reads. `SampleSink` converts borrowed USB completions directly into caller
+`Complex32` storage. A four-byte carry handles arbitrarily split I/Q frames;
+only samples beyond caller capacity are copied into reusable raw tail storage.
+The stock `le:S12/16>>0` format has a fixed-shift conversion loop; other supported
+formats retain the generic decoder. No unsafe uninitialized vector lengths or
+platform-specific SIMD are needed.
+
+`IiodClient::integer` and channel-mask parsing use stack storage, `ReadRequest`
+validates and formats the command once per stream, the USB request ledger is a
+fixed array, and OUT buffers are recycled. Async payload completion waits share
+one deadline timer per chunk instead of allocating a timer per completion.
+FutureSDR's one-channel `AsyncSource::work` uses a stack array for output slices.
+Seify's dynamic dispatch still boxes a read future, and WebUSB/nusb still creates
+browser transfer promises and copies each browser ArrayBuffer into WASM memory.
+The stream loop itself adds no mutex or background task.
+
+After consuming a complete response, `RxStream` writes exactly one next READBUF
+command before returning. This lets the device prepare a buffer during caller
+processing. It does **not** queue host reads across an unparsed header or run a
+background receive loop. The next nonzero-timeout refill resumes that response,
+with a fresh deadline; cached samples can still be polled with zero timeout.
+The serialized client rejects other commands until the response is consumed.
+Cancellation while consuming or writing a request poisons the session. Stop
+uses FunctionFS CLOSE_PIPE when a response is outstanding, terminating the pipe
+interpreter and its buffer, instead of appending a CLOSE behind unread data.
+This uses the existing ASCII request/response protocol and `usb_close_pipe` /
+`usbd_client_thread` lifecycle described above; it requires no firmware changes.
+
+Paired five-second native release runs on the same hardware, using a saved
+executable of the four-transfer implementation as the baseline:
+
+| Mode | Buffer, complex samples | Four-transfer baseline, MS/s | Direct decoding + read ahead, MS/s |
+| --- | ---: | ---: | ---: |
+| Async | 65,536 | 6.06 | 7.11 |
+| Async, repeat | 65,536 | 6.02 | 7.16 |
+| Blocking | 65,536 | 6.39 | 7.05 |
+| Async | 262,144 | 6.44 | 7.64 |
+
+The default buffer and four-by-64-KiB queue are unchanged. The default async gain
+is about 17–19%, reaching 28.4–28.6 MB/s of USB sample payload. These measurements
+combine all changes; they do not assign the gain to an individual optimization.
+Hardware lifecycle checks cover read-ahead stop/restart, active Drop, small
+outputs, concurrent control, cancelled reads and timeout recovery. Fragmentation
+tests exercise every split size, and exhaustive 16-bit-word tests compare the
+specialized and generic sample conversion. WebUSB tests run the production nusb
+endpoint path with delayed JavaScript mocks, checking four recycled buffers,
+borrowed payload delivery, callback failure and cancellation cleanup. Browser
+hardware throughput remains a separate measurement.

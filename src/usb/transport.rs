@@ -1,5 +1,10 @@
 use super::discovery::{DeviceDescriptor, InterfaceInfo, inspect_device};
-use crate::{Error, Result, iiod::Transport, maybe_future::dual};
+use super::read_queue::{ReadQueue, TRANSFER_BYTES, TRANSFER_COUNT};
+use crate::{
+    Error, Result,
+    iiod::Transport,
+    maybe_future::{PlatformSend, dual},
+};
 use nusb::{
     Endpoint, Interface, MaybeFuture,
     transfer::{Buffer, Bulk, ControlOut, ControlType, In, Out, Recipient},
@@ -8,10 +13,14 @@ use std::{collections::VecDeque, time::Duration};
 
 const PIPE_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[cfg(all(test, target_arch = "wasm32"))]
+#[path = "webusb_tests.rs"]
+mod webusb_tests;
+
 /// One owned FunctionFS control pipe. No Ethernet/TCP path exists.
 pub struct NusbTransport {
-    input: Endpoint<Bulk, In>,
-    output: Endpoint<Bulk, Out>,
+    input: Option<Endpoint<Bulk, In>>,
+    output: Option<Endpoint<Bulk, Out>>,
     interface: Interface,
     _device: nusb::Device,
     descriptor: InterfaceInfo,
@@ -19,6 +28,8 @@ pub struct NusbTransport {
     pipe: u16,
     deadline: Option<web_time::Instant>,
     buffered: VecDeque<u8>,
+    spare_reads: Vec<Buffer>,
+    spare_write: Option<Buffer>,
     needs_cleanup: bool,
     closed: bool,
 }
@@ -76,8 +87,8 @@ impl NusbTransport {
             .get(usize::from(pipe))
             .ok_or(Error::InvalidConfig("missing streaming endpoint pair"))?;
         Ok(Self {
-            input: interface.endpoint::<Bulk, In>(pair.in_address)?,
-            output: interface.endpoint::<Bulk, Out>(pair.out_address)?,
+            input: Some(interface.endpoint::<Bulk, In>(pair.in_address)?),
+            output: Some(interface.endpoint::<Bulk, Out>(pair.out_address)?),
             interface,
             _device: device,
             descriptor,
@@ -85,6 +96,8 @@ impl NusbTransport {
             pipe,
             deadline: None,
             buffered: VecDeque::new(),
+            spare_reads: Vec::with_capacity(TRANSFER_COUNT),
+            spare_write: None,
             needs_cleanup: true,
             closed: false,
         })
@@ -164,15 +177,106 @@ impl NusbTransport {
         max: usize,
     ) -> Result<Option<Vec<u8>>> {
         completion.status?;
-        self.buffered
-            .extend(completion.buffer[..completion.actual_len].iter().copied());
-        Ok(self.take_buffered(max))
+        let mut bytes = completion.buffer.into_vec();
+        bytes.truncate(completion.actual_len);
+        if bytes.len() > max {
+            self.buffered.extend(bytes.drain(max..));
+        }
+        Ok((!bytes.is_empty()).then_some(bytes))
     }
+
+    fn write_buffer(&mut self, bytes: &[u8]) -> Buffer {
+        let mut buffer = self
+            .spare_write
+            .take()
+            .filter(|b| b.capacity() >= bytes.len())
+            .unwrap_or_else(|| {
+                self.output
+                    .as_mut()
+                    .expect("owned endpoint")
+                    .allocate(bytes.len().max(1024))
+            });
+        buffer.clear();
+        buffer.extend_from_slice(bytes);
+        buffer
+    }
+
+    fn recycle_write(
+        &mut self,
+        completion: nusb::transfer::Completion,
+        length: usize,
+    ) -> Result<()> {
+        check_write(&completion, length)?;
+        self.spare_write = Some(completion.buffer);
+        Ok(())
+    }
+
+    fn submit_reads(&mut self, queue: &mut ReadQueue) {
+        while let Some(length) = queue.next_request() {
+            let mut buffer = self.spare_reads.pop().unwrap_or_else(|| {
+                self.input
+                    .as_mut()
+                    .expect("owned endpoint")
+                    .allocate(TRANSFER_BYTES)
+            });
+            buffer.set_requested_len(length);
+            self.input.as_mut().expect("owned endpoint").submit(buffer);
+        }
+    }
+
+    fn receive_payload<F: FnMut(&[u8]) -> Result<()>>(
+        &mut self,
+        queue: &mut ReadQueue,
+        completion: nusb::transfer::Completion,
+        consume: &mut F,
+    ) -> Result<usize> {
+        completion.status?;
+        let count = queue.complete(completion.actual_len)?;
+        consume(&completion.buffer[..count])?;
+        self.buffered.extend(
+            completion.buffer[count..completion.actual_len]
+                .iter()
+                .copied(),
+        );
+        self.spare_reads.push(completion.buffer);
+        Ok(count)
+    }
+
+    fn consume_buffered<F: FnMut(&[u8]) -> Result<()>>(
+        &mut self,
+        length: usize,
+        consume: &mut F,
+    ) -> Result<usize> {
+        let count = length.min(self.buffered.len());
+        let (first, second) = self.buffered.as_slices();
+        let n = count.min(first.len());
+        if n != 0 {
+            consume(&first[..n])?;
+        }
+        if count > n {
+            consume(&second[..count - n])?;
+        }
+        self.buffered.drain(..count);
+        Ok(count)
+    }
+
+    async fn drain_pending(&mut self) -> Result<()> {
+        while self.output.as_ref().unwrap().pending() != 0 {
+            let timeout = self.remaining_timeout()?;
+            timed(self.output.as_mut().unwrap().next_complete(), timeout).await?;
+        }
+        while self.input.as_ref().unwrap().pending() != 0 {
+            let timeout = self.remaining_timeout()?;
+            timed(self.input.as_mut().unwrap().next_complete(), timeout).await?;
+        }
+        Ok(())
+    }
+
     fn cancel_pending(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.input.cancel_all();
-            self.output.cancel_all();
+            self.input.as_mut().expect("owned endpoint").cancel_all();
+            self.output.as_mut().expect("owned endpoint").cancel_all();
         }
     }
 }
@@ -251,21 +355,32 @@ impl Transport for NusbTransport {
             |(this, command): (&mut Self, &[u8])| {
                 this.check_open()?;
                 let timeout = this.remaining_timeout()?;
+                let buffer = this.write_buffer(command);
                 let completion = this
                     .output
-                    .transfer_blocking(command.to_vec().into(), timeout);
+                    .as_mut()
+                    .expect("owned endpoint")
+                    .transfer_blocking(buffer, timeout);
                 check_blocking_timeout(&completion)?;
-                check_write(completion, command.len())
+                this.recycle_write(completion, command.len())
             },
             |(this, command): (&mut Self, &[u8])| async move {
                 this.check_open()?;
                 let timeout = this.remaining_timeout()?;
-                this.output.submit(command.to_vec().into());
-                let result = timed(this.output.next_complete(), timeout).await;
+                let buffer = this.write_buffer(command);
+                this.output.as_mut().expect("owned endpoint").submit(buffer);
+                let result = timed(
+                    this.output
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .next_complete(),
+                    timeout,
+                )
+                .await;
                 if result.is_err() {
                     this.cancel_pending();
                 }
-                check_write(result?, command.len())
+                this.recycle_write(result?, command.len())
             }
         )
     }
@@ -283,8 +398,18 @@ impl Transport for NusbTransport {
                 }
                 for _ in 0..16 {
                     let timeout = this.remaining_timeout()?;
-                    let size = read_size(max, this.input.max_packet_size());
-                    let completion = this.input.transfer_blocking(Buffer::new(size), timeout);
+                    let size = read_size(
+                        max,
+                        this.input
+                            .as_mut()
+                            .expect("owned endpoint")
+                            .max_packet_size(),
+                    );
+                    let completion = this
+                        .input
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .transfer_blocking(Buffer::new(size), timeout);
                     check_blocking_timeout(&completion)?;
                     if let Some(bytes) = this.accept_read(completion, max)? {
                         return Ok(bytes);
@@ -302,9 +427,22 @@ impl Transport for NusbTransport {
                 }
                 for _ in 0..16 {
                     let timeout = this.remaining_timeout()?;
-                    let size = read_size(max, this.input.max_packet_size());
-                    this.input.submit(Buffer::new(size));
-                    let result = timed(this.input.next_complete(), timeout).await;
+                    let size = read_size(
+                        max,
+                        this.input
+                            .as_mut()
+                            .expect("owned endpoint")
+                            .max_packet_size(),
+                    );
+                    this.input
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .submit(Buffer::new(size));
+                    let result = timed(
+                        this.input.as_mut().expect("owned endpoint").next_complete(),
+                        timeout,
+                    )
+                    .await;
                     if result.is_err() {
                         this.cancel_pending();
                     }
@@ -313,6 +451,103 @@ impl Transport for NusbTransport {
                     }
                 }
                 Err(Error::Protocol("too many empty USB completions"))
+            }
+        )
+    }
+
+    fn consume_exact<F>(
+        &mut self,
+        length: usize,
+        consume: F,
+    ) -> impl MaybeFuture<Output = Result<()>>
+    where
+        F: FnMut(&[u8]) -> Result<()> + PlatformSend,
+    {
+        dual!(
+            (self, length, consume),
+            |(this, length, mut consume): (&mut Self, usize, F)| {
+                this.check_open()?;
+                let mut offset = this.consume_buffered(length, &mut consume)?;
+                if offset == length {
+                    return Ok(());
+                }
+                let mut queue = ReadQueue::new(
+                    length - offset,
+                    this.input
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .max_packet_size(),
+                );
+                let mut empty = 0;
+                while offset < length {
+                    let timeout = this.remaining_timeout()?;
+                    this.submit_reads(&mut queue);
+                    let completion = match this
+                        .input
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .wait_next_complete(timeout)
+                    {
+                        Some(completion) => completion,
+                        None => {
+                            this.cancel_pending();
+                            return Err(Error::Timeout);
+                        }
+                    };
+                    let n = this.receive_payload(&mut queue, completion, &mut consume)?;
+                    empty = if n == 0 { empty + 1 } else { 0 };
+                    if empty == 16 {
+                        return Err(Error::Protocol("too many empty USB completions"));
+                    }
+                    offset += n;
+                }
+                Ok(())
+            },
+            |(this, length, mut consume): (&mut Self, usize, F)| async move {
+                this.check_open()?;
+                let mut offset = this.consume_buffered(length, &mut consume)?;
+                if offset == length {
+                    return Ok(());
+                }
+                let mut queue = ReadQueue::new(
+                    length - offset,
+                    this.input
+                        .as_mut()
+                        .expect("owned endpoint")
+                        .max_packet_size(),
+                );
+                let mut timer =
+                    std::pin::pin!(futures_timer::Delay::new(this.remaining_timeout()?));
+                let mut empty = 0;
+                while offset < length {
+                    this.remaining_timeout()?;
+                    this.submit_reads(&mut queue);
+                    let result = futures_lite::future::race(
+                        async {
+                            Ok(this
+                                .input
+                                .as_mut()
+                                .expect("owned endpoint")
+                                .next_complete()
+                                .await)
+                        },
+                        async {
+                            timer.as_mut().await;
+                            Err(Error::Timeout)
+                        },
+                    )
+                    .await;
+                    if result.is_err() {
+                        this.cancel_pending();
+                    }
+                    let n = this.receive_payload(&mut queue, result?, &mut consume)?;
+                    empty = if n == 0 { empty + 1 } else { 0 };
+                    if empty == 16 {
+                        return Err(Error::Protocol("too many empty USB completions"));
+                    }
+                    offset += n;
+                }
+                Ok(())
             }
         )
     }
@@ -336,6 +571,7 @@ impl Transport for NusbTransport {
                     return Ok(());
                 }
                 this.cancel_pending();
+                this.drain_pending().await?;
                 this.pipe_command(2).await?;
                 this.needs_cleanup = false;
                 Ok(())
@@ -358,7 +594,7 @@ fn validate_command(command: &[u8]) -> Result<()> {
     }
     Ok(())
 }
-fn check_write(completion: nusb::transfer::Completion, length: usize) -> Result<()> {
+fn check_write(completion: &nusb::transfer::Completion, length: usize) -> Result<()> {
     completion.status?;
     if completion.actual_len != length {
         return Err(Error::Protocol("short command write"));
@@ -393,10 +629,22 @@ impl Drop for NusbTransport {
             let interface = self.interface.clone();
             let number = self.descriptor.number;
             let pipe = self.pipe;
+            let mut input = self.input.take().unwrap();
+            let mut output = self.output.take().unwrap();
             wasm_bindgen_futures::spawn_local(async move {
+                // WebUSB cannot cancel individual transfers. Keep ownership
+                // of the endpoints while closing the FunctionFS session and
+                // settling any abandoned requests. This prevents a new stream
+                // from claiming endpoints whose old reads can still consume data.
                 let _ = interface
                     .control_out(pipe_request(2, number, pipe), PIPE_TIMEOUT)
                     .await;
+                while output.pending() != 0 {
+                    output.next_complete().await;
+                }
+                while input.pending() != 0 {
+                    input.next_complete().await;
+                }
             });
         }
     }
@@ -447,7 +695,7 @@ mod tests {
             status: Ok(()),
         };
         assert!(matches!(
-            check_write(completion, 7),
+            check_write(&completion, 7),
             Err(Error::Protocol("short command write"))
         ));
     }
