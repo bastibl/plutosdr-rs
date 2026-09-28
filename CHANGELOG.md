@@ -27,6 +27,9 @@ The public API is experimental and may change between releases.
 - WASM protocol and mocked WebUSB lifecycle tests run under Node. Chrome/WebUSB
   decoded real WLAN frames with live gain/channel changes on connected hardware.
   Detailed qualification is recorded separately in `docs/protocol.md`.
+- The FutureSDR WLAN browser example can retain a stale "running" status after
+  USB unplug. Reconnecting, reloading the page, and starting RX restored frame
+  decoding. Automatic disconnect reporting/recovery is not qualified.
 - TX, timestamps, and reliable sample-loss/overflow reporting are not implemented.
 - RX uses 16-bit storage for each I/Q component. Continuous 20 MS/s requires
   80 MB/s and exceeds USB 2.0 capacity. Custom firmware 8-bit modes are unsupported.

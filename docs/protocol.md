@@ -418,3 +418,12 @@ This establishes browser hardware reception and control, not lossless 20 MS/s
 capture or a measured browser sample throughput. Native blocking and async
 hardware lifecycle/recovery checks were also rerun successfully on this date.
 No ambient frame contents or network identifiers are stored in this repository.
+
+A physical USB unplug stopped frame delivery, but the WLAN page retained its
+last "running" status and frame count instead of reporting disconnection.
+This end-to-end UI/error-propagation behavior is a known limitation; the smoke
+test does not establish automatic disconnect recovery or isolate the cause to
+the driver, Seify, or the FutureSDR runtime.
+After reconnecting the device and allowing it to boot, reloading the page and
+clicking Start RX reopened Pluto and decoded at least 67 additional WLAN frames.
+No firmware change, browser restart, or permission reset was required.
