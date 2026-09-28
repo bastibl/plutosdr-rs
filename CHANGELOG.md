@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- Add capability detection and blocking/async controls for RF and baseband DC
+  offset tracking.
+- Load ADI FIR profiles when setting sample rate, supporting 520,834 through
+  61,440,000 samples/s and transitions between low and high rates.
+- Match RX analog bandwidth to the actual sample-rate readback; an explicit
+  bandwidth setting afterwards overrides this default.
+- Reset stale FPGA decimation and report the full managed sample-rate range.
+- Extend protocol and hardware tests for FIR configuration, rate transitions,
+  and DC tracking.
+
 ## 0.1.0 — Initial experimental release
 
 Native Rust PlutoSDR driver using `nusb` and the native IIO FunctionFS USB
